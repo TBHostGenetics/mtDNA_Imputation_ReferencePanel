@@ -1,0 +1,145 @@
+#!/usr/bin/bash
+
+#PBS -N mtdna_filter
+#PBS -l walltime=3:00:00
+#PBS -l select=1:ncpus=24:mpiprocs=24
+#PBS -P HEAL1360
+#PBS -q test
+#PBS -e /mnt/lustre/users/dsmith/Imputation/New_RefPanel/filter.err
+#PBS -o /mnt/lustre/users/dsmith/Imputation/New_RefPanel/filter.out
+#PBS -M dayna@sun.ac.za
+#PBS -m abe
+
+set -euo pipefail
+
+cd /mnt/lustre/users/dsmith/Imputation/New_RefPanel
+LOG="logs/02_filter.log"
+mkdir -p "logs"
+exec > >(tee -a "${LOG}") 2>&1
+
+echo "=============================================="
+echo " Step 02: Quality Filtering"
+echo " $(date)"
+echo "=============================================="
+
+# =============================================================================
+# PARAMETERS
+# =============================================================================
+IN_MSA="aligned/full_msa_rcrs_trimmed.fasta"
+OUTDIR="filtered"
+OUT_MSA="${OUTDIR}/filtered_msa.fasta"
+REPORT="${OUTDIR}/filter_report.tsv"
+EXCLUDED="${OUTDIR}/excluded_ids.txt"
+MAX_AMBIG=5    # Sequences with >= this many ambiguous chars are excluded
+MAX_GAPS=8     # Sequences with >= this many gap chars are excluded
+RCRS_ACCESSION="NC_012920.1"    # rCRS is always retained regardless of stats
+
+mkdir -p "${OUTDIR}"
+
+# =============================================================================
+# Run quality filter (Python)
+# =============================================================================
+module add chpc/BIOMODULES
+module add python
+python -c 'import Bio; print (Bio.__version__)' 1.81
+
+export IN_MSA OUT_MSA REPORT EXCLUDED MAX_AMBIG MAX_GAPS RCRS_ACCESSION
+
+python3 - <<'PYEOF'
+import os
+from Bio import SeqIO
+
+in_fasta     = os.environ["IN_MSA"]
+out_fasta    = os.environ["OUT_MSA"]
+report_path  = os.environ["REPORT"]
+excl_path    = os.environ["EXCLUDED"]
+max_ambig    = int(os.environ["MAX_AMBIG"])
+max_gaps     = int(os.environ["MAX_GAPS"])
+rcrs_id      = os.environ["RCRS_ACCESSION"]
+
+# IUPAC ambiguous bases (excluding gap characters which are handled separately)
+# Standard bases: A, C, G, T
+# Gaps: -, .
+# Ambiguous: everything else (R, Y, S, W, K, M, B, D, H, V, N, ?)
+STANDARD = set("ACGTacgt")
+GAPS     = set("-.")
+
+def count_ambig_and_gaps(seq_str):
+    ngaps  = sum(1 for b in seq_str if b in GAPS)
+    nambig = sum(1 for b in seq_str if b not in STANDARD and b not in GAPS)
+    return nambig, ngaps
+
+print(f"[02] Reading MSA from: {in_fasta}")
+records = list(SeqIO.parse(in_fasta, "fasta"))
+print(f"[02] Total sequences loaded: {len(records)}")
+
+passed, excluded_ids = [], []
+
+with open(report_path, "w") as rpt:
+    rpt.write("seq_id\tseq_len\tn_ambig\tn_gaps\tstatus\texclusion_reason\n")
+
+    for rec in records:
+        seq_str = str(rec.seq).upper()
+        nambig, ngaps = count_ambig_and_gaps(seq_str)
+        seq_len = len(seq_str)
+
+        # Always retain rCRS regardless of stats
+        is_rcrs = (rec.id == rcrs_id or
+                   rec.id.split(".")[0] == rcrs_id.split(".")[0])
+        if is_rcrs:
+            reason = ""
+            status = "PASS_RCRS"
+            passed.append(rec)
+        elif nambig >= max_ambig and ngaps >= max_gaps:
+            reason = f"ambig>={max_ambig}_AND_gaps>={max_gaps}"
+            status = "FAIL"
+            excluded_ids.append(rec.id)
+        elif nambig >= max_ambig:
+            reason = f"ambig>={max_ambig}"
+            status = "FAIL"
+            excluded_ids.append(rec.id)
+        elif ngaps >= max_gaps:
+            reason = f"gaps>={max_gaps}"
+            status = "FAIL"
+            excluded_ids.append(rec.id)
+        else:
+            reason = ""
+            status = "PASS"
+            passed.append(rec)
+
+        rpt.write(f"{rec.id}\t{seq_len}\t{nambig}\t{ngaps}\t{status}\t{reason}\n")
+
+# Write outputs
+SeqIO.write(passed, out_fasta, "fasta")
+
+with open(excl_path, "w") as ef:
+    ef.write("\n".join(excluded_ids) + "\n")
+
+n_total    = len(records)
+n_passed   = len(passed)
+n_excluded = len(excluded_ids)
+
+print(f"[02] Filtering complete.")
+print(f"     Thresholds  : ambiguous >= {max_ambig} OR gaps >= {max_gaps}")
+print(f"     Input seqs  : {n_total}")
+print(f"     Passed      : {n_passed}  ({100*n_passed/n_total:.1f}%)")
+print(f"     Excluded    : {n_excluded}  ({100*n_excluded/n_total:.1f}%)")
+print(f"     Filtered MSA: {out_fasta}")
+print(f"     Report      : {report_path}")
+print(f"     Excluded IDs: {excl_path}")
+PYEOF
+
+# =============================================================================
+# Summary stats from report
+# =============================================================================
+echo ""
+echo "[02] Exclusion breakdown:"
+awk -F'\t' 'NR>1 && $6!="" {print $6}' "${REPORT}" | sort | uniq -c | sort -rn | \
+    awk '{printf "     %-40s %s sequences\n", $2, $1}'
+
+echo ""
+echo "[02] Quality filtering complete."
+echo "     Filtered MSA : ${OUT_MSA}"
+echo "     Report       : ${REPORT}"
+echo ""
+echo "     Next step: bash 03_msa_to_vcf.sh"

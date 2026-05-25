@@ -1,0 +1,71 @@
+#!/usr/bin/bash
+
+#PBS -N msa_to_vcf
+#PBS -l walltime=12:00:00
+#PBS -l select=1:ncpus=24:mpiprocs=24
+#PBS -P HEAL1360
+#PBS -q smp
+#PBS -e /mnt/lustre/users/dsmith/Imputation/New_RefPanel/msa_to_vcf.err
+#PBS -o /mnt/lustre/users/dsmith/Imputation/New_RefPanel/msa_to_vcf.out
+#PBS -M dayna@sun.ac.za
+#PBS -m abe
+
+set -euo pipefail
+
+cd /mnt/lustre/users/dsmith/Imputation/New_RefPanel
+LOG="logs/03_msa_to_vcf.log"
+mkdir -p "logs"
+exec > >(tee -a "${LOG}") 2>&1
+
+echo "=============================================="
+echo " Step 03: MSA → VCF Conversion"
+echo " $(date)"
+echo "=============================================="
+
+# =============================================================================
+# PARAMETERS
+# =============================================================================
+IN_MSA="filtered/filtered_msa.fasta"
+OUTDIR="data/vcf"
+OUT_VCF="${OUTDIR}/mtdna_raw.vcf"
+RCRS_ACCESSION="NC_012920.1"
+SCRIPT="scripts/msa_to_vcf.py"
+
+mkdir -p "${OUTDIR}"
+
+# =============================================================================
+# Load modules
+# =============================================================================
+module add chpc/BIOMODULES
+module add python
+python -c 'import Bio; print (Bio.__version__)' 1.81
+
+# =============================================================================
+# Run conversion
+# =============================================================================
+NSEQS=$(grep -c "^>" "${IN_MSA}")
+echo "[03] Input MSA : ${IN_MSA} (${NSEQS} sequences)"
+echo "[03] Output VCF: ${OUT_VCF}"
+echo "[03] rCRS      : ${RCRS_ACCESSION}"
+echo ""
+
+python3 "${SCRIPT}" \
+    --msa  "${IN_MSA}" \
+    --out  "${OUT_VCF}" \
+    --rcrs "${RCRS_ACCESSION}"
+
+# =============================================================================
+# Quick sanity check
+# =============================================================================
+NSITES=$(grep -v "^#" "${OUT_VCF}" | wc -l)
+echo ""
+echo "[03] VCF sanity check:"
+echo "     Variant sites in VCF : ${NSITES}"
+echo "     First 5 variant sites:"
+grep -v "^#" "${OUT_VCF}" | head -5 | cut -f1-8 | column -t
+
+echo ""
+echo "[03] MSA → VCF complete."
+echo "     VCF: ${OUT_VCF}"
+echo ""
+echo "     Next step: bash 04_vcf_process.sh"

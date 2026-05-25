@@ -1,0 +1,223 @@
+#!/bin/bash
+
+#PBS -N mtdna_align
+#PBS -l walltime=24:00:00
+#PBS -l select=1:ncpus=24:mpiprocs=24
+#PBS -P HEAL1360
+#PBS -q smp
+#PBS -e /mnt/lustre/users/dsmith/Imputation/New_RefPanel/align.err
+#PBS -o /mnt/lustre/users/dsmith/Imputation/New_RefPanel/align.out
+#PBS -M dayna@sun.ac.za
+#PBS -m abe
+
+set -euo pipefail
+
+cd /mnt/lustre/users/dsmith/Imputation/New_RefPanel
+LOG="logs/01_align.log"
+mkdir -p "logs"
+exec > >(tee -a "${LOG}") 2>&1
+
+echo "=============================================="
+echo " Step 01: MAFFT Alignment"
+echo " $(date)"
+echo "=============================================="
+
+# =============================================================================
+# PARAMETERS
+# =============================================================================
+RAW_FASTA="sequence.fasta"
+REF_MSA="../MitoImpute/resources/alignments/hsapiensCRS7k.fasta"
+OUTDIR="aligned"
+BATCH_SIZE=2500
+THREADS=16
+RCRS_ACCESSION="NC_012920.1"
+
+# =============================================================================
+# Load modules
+# =============================================================================
+module add chpc/BIOMODULES
+module add mafft/7.453
+module add python
+python -c 'import Bio; print (Bio.__version__)' 1.81
+
+# =============================================================================
+# Sequence counts
+# =============================================================================
+REF_NSEQS=$(grep -c "^>" "${REF_MSA}")
+RAW_NSEQS=$(grep -c "^>" "${RAW_FASTA}")
+echo "[01] Reference MSA : ${REF_NSEQS} sequences — ${REF_MSA}"
+echo "[01] Raw sequences : ${RAW_NSEQS} sequences — ${RAW_FASTA}"
+echo "[01] Batch size    : ${BATCH_SIZE}"
+
+# =============================================================================
+# Step 1a: Split raw sequences into batches
+# =============================================================================
+BATCH_DIR="${OUTDIR}/batches"
+mkdir -p "${BATCH_DIR}"
+
+echo "[01] Splitting raw sequences into batches..."
+
+export RAW_FASTA BATCH_DIR BATCH_SIZE
+
+python3 - <<'PYEOF'
+import os
+from Bio import SeqIO
+
+raw_fasta  = os.environ["RAW_FASTA"]
+batch_dir  = os.environ["BATCH_DIR"]
+batch_size = int(os.environ["BATCH_SIZE"])
+
+records = list(SeqIO.parse(raw_fasta, "fasta"))
+print(f"[01]   Loaded {len(records)} sequences from raw FASTA.")
+
+for i in range(0, len(records), batch_size):
+    batch = records[i : i + batch_size]
+    batch_num = i // batch_size + 1
+    out_path = os.path.join(batch_dir, f"batch_{batch_num:04d}.fasta")
+    SeqIO.write(batch, out_path, "fasta")
+    print(f"[01]   Batch {batch_num}: {len(batch)} sequences -> {out_path}")
+
+print(f"[01]   Total batches: {(len(records) + batch_size - 1) // batch_size}")
+PYEOF
+
+NBATCHES=$(ls "${BATCH_DIR}"/batch_*.fasta 2>/dev/null | wc -l)
+echo "[01] Created ${NBATCHES} batch files."
+
+# =============================================================================
+# Step 1b: Align each batch to the reference MSA using MAFFT --add
+# =============================================================================
+ALIGNED_DIR="${OUTDIR}/aligned_batches"
+mkdir -p "${ALIGNED_DIR}"
+
+BATCH_NUM=0
+for BATCH_FASTA in "${BATCH_DIR}"/batch_*.fasta; do
+    BATCH_NUM=$(( BATCH_NUM + 1 ))
+    BATCH_NAME=$(basename "${BATCH_FASTA}" .fasta)
+    ALIGNED_OUT="${ALIGNED_DIR}/${BATCH_NAME}_aligned.fasta"
+
+    if [[ -f "${ALIGNED_OUT}" ]]; then
+        echo "[01]   Skipping ${BATCH_NAME} (output already exists)."
+        continue
+    fi
+
+    echo "[01]   Aligning ${BATCH_NAME} (${BATCH_NUM}/${NBATCHES})..."
+
+    mafft \
+        --add "${BATCH_FASTA}" \
+        --keeplength \
+        --reorder \
+        --thread "${THREADS}" \
+        "${REF_MSA}" \
+        > "${ALIGNED_OUT}" \
+        2>> "${LOG}"
+
+    echo "[01]   Done: ${ALIGNED_OUT}"
+done
+
+# =============================================================================
+# Step 1c: Merge all aligned batches into one MSA
+# =============================================================================
+echo "[01] Merging aligned batches..."
+
+MERGED_MSA="${OUTDIR}/full_msa.fasta"
+
+export REF_MSA ALIGNED_DIR MERGED_MSA
+
+python3 - <<'PYEOF'
+import os
+from Bio import SeqIO
+
+ref_msa     = os.environ["REF_MSA"]
+aligned_dir = os.environ["ALIGNED_DIR"]
+merged_out  = os.environ["MERGED_MSA"]
+
+ref_ids = {rec.id for rec in SeqIO.parse(ref_msa, "fasta")}
+written, out_records = set(), []
+
+aligned_batches = sorted(
+    f for f in os.listdir(aligned_dir) if f.endswith("_aligned.fasta")
+)
+
+if not aligned_batches:
+    raise FileNotFoundError(f"No aligned batch files found in: {aligned_dir}")
+
+# Take reference sequences from the first batch output
+first_batch = aligned_batches[0]
+for rec in SeqIO.parse(os.path.join(aligned_dir, first_batch), "fasta"):
+    if rec.id in ref_ids and rec.id not in written:
+        out_records.append(rec)
+        written.add(rec.id)
+
+# From each batch, extract only the newly added (non-reference) sequences
+for fname in aligned_batches:
+    for rec in SeqIO.parse(os.path.join(aligned_dir, fname), "fasta"):
+        if rec.id not in ref_ids and rec.id not in written:
+            out_records.append(rec)
+            written.add(rec.id)
+
+SeqIO.write(out_records, merged_out, "fasta")
+print(f"[01]   Merged MSA: {len(out_records)} sequences -> {merged_out}")
+PYEOF
+
+# =============================================================================
+# Step 1d: Remove sites that introduce gaps in the rCRS
+# =============================================================================
+echo "[01] Removing MSA columns that introduce gaps in the rCRS..."
+
+TRIMMED_MSA="${OUTDIR}/full_msa_rcrs_trimmed.fasta"
+
+export MERGED_MSA TRIMMED_MSA RCRS_ACCESSION
+
+python3 - <<'PYEOF'
+import os
+from Bio import SeqIO
+
+merged_fasta = os.environ["MERGED_MSA"]
+trimmed_out  = os.environ["TRIMMED_MSA"]
+rcrs_id      = os.environ.get("RCRS_ACCESSION", "NC_012920.1")
+
+records = list(SeqIO.parse(merged_fasta, "fasta"))
+
+# Find rCRS — match on accession prefix to handle version suffixes (e.g. .1)
+rcrs_rec = None
+for rec in records:
+    if rec.id == rcrs_id or rec.id.split(".")[0] == rcrs_id.split(".")[0]:
+        rcrs_rec = rec
+        break
+
+if rcrs_rec is None:
+    raise ValueError(
+        f"rCRS accession '{rcrs_id}' not found in merged MSA. "
+        "Ensure it was present in both the raw FASTA and the reference MSA."
+    )
+
+print(f"[01]   rCRS found: {rcrs_rec.id}  (aligned length: {len(rcrs_rec.seq)})")
+
+# Columns where rCRS has a real base (not a gap) are kept
+rcrs_seq = str(rcrs_rec.seq).upper()
+keep_cols = [i for i, base in enumerate(rcrs_seq) if base not in ("-", ".")]
+
+print(f"[01]   Aligned columns  : {len(rcrs_seq)}")
+print(f"[01]   rCRS gap columns : {len(rcrs_seq) - len(keep_cols)} (removed)")
+print(f"[01]   Columns retained : {len(keep_cols)}")
+
+# Slice all sequences to the kept columns
+trimmed = []
+for rec in records:
+    seq_str = str(rec.seq)
+    trimmed_seq = "".join(seq_str[i] for i in keep_cols)
+    rec.seq = rec.seq.__class__(trimmed_seq)
+    trimmed.append(rec)
+
+SeqIO.write(trimmed, trimmed_out, "fasta")
+print(f"[01]   Trimmed MSA written: {trimmed_out}")
+PYEOF
+
+NSEQS=$(grep -c "^>" "${TRIMMED_MSA}")
+echo ""
+echo "[01] Alignment complete."
+echo "     Sequences in final MSA : ${NSEQS}"
+echo "     Full MSA               : ${MERGED_MSA}"
+echo "     rCRS-trimmed MSA       : ${TRIMMED_MSA}"
+echo ""
+echo "     Next step: bash 02_filter.sh"
